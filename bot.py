@@ -2,11 +2,19 @@ import os
 import asyncio
 import logging
 import aiohttp
+from datetime import datetime
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
 from db import Database
+from moderation import is_admin, mod_action, parse_mod_args, send_server_command, search_players, lookup_player
+from admin_panel import (
+    AdminState, admin_main_kb, admin_main_text, back_kb,
+    BAN_HELP, KICK_HELP, MUTE_HELP, SEARCH_HELP, SEARCH_MC_HELP,
+    format_ban_log, format_tg_search_result, format_player_card, parse_panel_ban,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -15,59 +23,41 @@ BOT_TOKEN       = os.getenv("BOT_TOKEN")
 PTERODACTYL_URL = os.getenv("PTERODACTYL_URL", "https://my.aurorix.net")
 PTERODACTYL_KEY = os.getenv("PTERODACTYL_KEY")
 SERVER_ID       = os.getenv("SERVER_ID", "6daf8160-16ab-4a5b-ac25-3e35cb75a3d4")
-TG_CHANNEL      = os.getenv("TG_CHANNEL", "@zerkavich")  # канал для проверки подписки
+TG_CHANNEL      = os.getenv("TG_CHANNEL", "@zerkavich")
 CHECK_SUB       = os.getenv("CHECK_SUBSCRIPTION", "false").lower() == "true"
+APPEAL_URL      = os.getenv("APPEAL_URL", "@zerkavich")
 
 bot = Bot(token=BOT_TOKEN)
 dp  = Dispatcher(storage=MemoryStorage())
 db  = Database("data.json")
 
 
-# ─── PTERODACTYL API ─────────────────────────────────────────────────────────
-async def send_server_command(command: str) -> bool:
-    url = f"{PTERODACTYL_URL}/api/client/servers/{SERVER_ID}/command"
-    headers = {
-        "Authorization": f"Bearer {PTERODACTYL_KEY}",
-        "Content-Type":  "application/json",
-        "Accept":        "application/json",
-    }
-    payload = {"command": command}
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                if resp.status in (200, 204):
-                    logger.info(f"Command sent OK: {command}")
-                    return True
-                text = await resp.text()
-                logger.error(f"Pterodactyl error {resp.status}: {text}")
-                return False
-    except Exception as e:
-        logger.error(f"send_server_command exception: {e}")
-        return False
-
-
 async def check_subscription(user_id: int) -> bool:
-    """Проверяет подписку на канал (необязательно)."""
     if not CHECK_SUB:
         return True
     try:
         member = await bot.get_chat_member(TG_CHANNEL, user_id)
         return member.status not in ("left", "kicked")
     except Exception:
-        return True  # если не удалось проверить — пропускаем
+        return True
 
 
 # ─── /start ──────────────────────────────────────────────────────────────────
 @dp.message(Command("start"))
 async def cmd_start(msg: Message):
+    # Админам — тихий намёк; обычным — обычное приветствие
+    admin_hint = ""
+    if is_admin(msg.from_user.id):
+        admin_hint = "\n\n🔧 <b>Режим администратора активен.</b> /admin"
     await msg.answer(
         "👋 <b>Добро пожаловать!</b>\n\n"
-        "Это бот верификации сервера Minecraft.\n\n"
+        "Бот верификации сервера Minecraft.\n\n"
         "📋 <b>Команды:</b>\n"
         "• /verify <code>КОД</code> — подтвердить аккаунт\n"
-        "• /status — проверить статус верификации\n"
-        "• /help — помощь\n\n"
-        f"📢 Канал сервера: {TG_CHANNEL}",
+        "• /status — статус верификации\n"
+        "• /help — инструкция\n\n"
+        f"📢 Канал: {TG_CHANNEL}"
+        f"{admin_hint}",
         parse_mode="HTML"
     )
 
@@ -78,11 +68,11 @@ async def cmd_help(msg: Message):
     await msg.answer(
         "❓ <b>Как верифицироваться:</b>\n\n"
         "1️⃣ Зайдите на сервер Minecraft\n"
-        "2️⃣ Введите команду <code>.econ verify</code>\n"
+        "2️⃣ Введите <code>.econ verify</code>\n"
         "3️⃣ Скопируйте код из игры\n"
-        "4️⃣ Отправьте боту: <code>/verify ВАШ_КОД</code>\n\n"
+        "4️⃣ Отправьте боту: <code>/verify КОД</code>\n\n"
         "✅ После верификации вы получите:\n"
-        "• Титул <b>«Гражданин»</b> в чате\n"
+        "• Титул <b>«Гражданин»</b>\n"
         "• <b>+200 T</b> на баланс\n"
         "• <b>+10 Trust Score</b>\n\n"
         "⚠️ Код действителен <b>30 минут</b>.",
@@ -96,15 +86,16 @@ async def cmd_status(msg: Message):
     uid  = str(msg.from_user.id)
     data = db.get_user(uid)
     if data and data.get("verified"):
+        mc = data.get("mc_name") or "—"
         await msg.answer(
             f"✅ <b>Аккаунт верифицирован!</b>\n\n"
-            f"👤 Minecraft-ник: <code>{data.get('mc_name', '—')}</code>\n"
+            f"🎮 MC-ник: <code>{mc}</code>\n"
             f"📅 Дата: {data.get('verified_at', '—')}",
             parse_mode="HTML"
         )
     else:
         await msg.answer(
-            "❌ <b>Аккаунт не верифицирован.</b>\n\n"
+            "❌ <b>Не верифицирован.</b>\n\n"
             "Используйте /verify <code>КОД</code> из игры.",
             parse_mode="HTML"
         )
@@ -116,101 +107,668 @@ async def cmd_verify(msg: Message):
     uid      = str(msg.from_user.id)
     username = msg.from_user.username or msg.from_user.first_name
 
-    # Уже верифицирован?
     data = db.get_user(uid)
     if data and data.get("verified"):
-        mc = data.get("mc_name", "—")
-        await msg.answer(
-            f"✅ Вы уже верифицированы как <code>{mc}</code>!\n"
-            "Повторная верификация невозможна.",
-            parse_mode="HTML"
-        )
+        await msg.answer("✅ Вы уже верифицированы!\nПовторная верификация невозможна.", parse_mode="HTML")
         return
 
-    # Проверка подписки
     if not await check_subscription(msg.from_user.id):
         kb = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text=f"📢 Подписаться на {TG_CHANNEL}", url=f"https://t.me/{TG_CHANNEL.lstrip('@')}")
+            InlineKeyboardButton(text="📢 Подписаться", url=f"https://t.me/{TG_CHANNEL.lstrip('@')}")
         ]])
-        await msg.answer(
-            f"⚠️ Для верификации нужно подписаться на канал {TG_CHANNEL}",
-            reply_markup=kb
-        )
+        await msg.answer(f"⚠️ Для верификации подпишитесь на {TG_CHANNEL}", reply_markup=kb)
         return
 
-    # Парсим код
     parts = msg.text.split(maxsplit=1)
     if len(parts) < 2 or not parts[1].strip():
         await msg.answer(
-            "❌ Укажите код из игры.\n\n"
-            "Пример: <code>/verify STEVE123456</code>\n\n"
-            "Код можно получить через <code>.econ verify</code> в Minecraft.",
+            "❌ Укажите код из игры.\n\nПример: <code>/verify STEVE123456</code>",
             parse_mode="HTML"
         )
         return
 
     code = parts[1].strip().upper()
-
-    # Базовая валидация кода
     if len(code) < 5 or len(code) > 20 or not code.isalnum():
-        await msg.answer("❌ Неверный формат кода. Проверьте и попробуйте снова.")
+        await msg.answer("❌ Неверный формат кода.")
         return
 
-    # Проверяем код в локальной БД (anti-abuse)
     if db.is_code_used(code):
         await msg.answer("❌ Этот код уже был использован.")
         return
 
-    # Отправляем команду на сервер
     tg_name = f"@{username}" if msg.from_user.username else username
     command = f'scriptevent econ:tg_verify {{"code":"{code}","tg_username":"{tg_name}","tg_id":"{uid}"}}'
 
     wait_msg = await msg.answer("⏳ Отправляю верификацию на сервер...")
+    ok, err = await send_server_command(command)
 
-    success = await send_server_command(command)
-
-    if success:
-        # Сохраняем в локальную БД
-        from datetime import datetime
+    if ok:
         db.mark_verified(uid, code, tg_name)
         db.mark_code_used(code)
-
         await wait_msg.delete()
         await msg.answer(
             "✅ <b>Верификация отправлена!</b>\n\n"
-            f"🔑 Код: <code>{code}</code>\n"
-            f"👤 TG: {tg_name}\n\n"
-            "Зайдите в игру — вы получите:\n"
+            f"🔑 Код: <code>{code}</code>\n\n"
+            "В игре вы получите:\n"
             "• Титул <b>«Гражданин»</b>\n"
             "• <b>+200 T</b> на баланс\n"
-            "• <b>+10 Trust Score</b>\n\n"
-            "⚠️ Если сервер был оффлайн — награда придёт при следующем входе.",
+            "• <b>+10 Trust Score</b>",
             parse_mode="HTML"
         )
-        logger.info(f"Verified: tg={uid} ({tg_name}), code={code}")
     else:
         await wait_msg.delete()
         await msg.answer(
-            "❌ <b>Не удалось подключиться к серверу.</b>\n\n"
-            "Возможные причины:\n"
-            "• Сервер выключен\n"
-            "• Технические работы\n\n"
-            "Попробуйте позже или обратитесь к администратору.",
+            f"❌ <b>Не удалось подключиться к серверу.</b>\n\n"
+            f"Попробуйте позже или обратитесь в {APPEAL_URL}",
             parse_mode="HTML"
         )
 
 
-# ─── НЕИЗВЕСТНЫЕ СООБЩЕНИЯ ───────────────────────────────────────────────────
-@dp.message()
-async def unknown(msg: Message):
+# ═══════════════════════════════════════════════════════════════════════════════
+# СКРЫТАЯ АДМИН-ПАНЕЛЬ
+# Не упоминается в /help и /start для обычных пользователей.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@dp.message(Command("admin"))
+async def cmd_admin(msg: Message, state: FSMContext):
+    if not is_admin(msg.from_user.id):
+        # Молча игнорируем — не выдаём что панель существует
+        return
+    await state.clear()
     await msg.answer(
-        "❓ Используйте /verify <code>КОД</code> для верификации\n"
-        "или /help для справки.",
+        admin_main_text(db),
+        reply_markup=admin_main_kb(),
         parse_mode="HTML"
     )
 
 
-# ─── ЗАПУСК ──────────────────────────────────────────────────────────────────
+# ─── Callback: навигация по панели ───────────────────────────────────────────
+
+@dp.callback_query(F.data == "adm:main")
+async def cb_admin_main(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
+        await call.answer("❌", show_alert=True)
+        return
+    await state.clear()
+    await call.message.edit_text(
+        admin_main_text(db),
+        reply_markup=admin_main_kb(),
+        parse_mode="HTML"
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data == "adm:close")
+async def cb_admin_close(call: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await call.message.delete()
+    await call.answer("Панель закрыта.")
+
+
+# ─── Бан ─────────────────────────────────────────────────────────────────────
+
+@dp.callback_query(F.data == "adm:ban")
+async def cb_admin_ban(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
+        await call.answer("❌", show_alert=True)
+        return
+    await state.set_state(AdminState.waiting_ban_input)
+    await call.message.edit_text(BAN_HELP, reply_markup=back_kb(), parse_mode="HTML")
+    await call.answer()
+
+
+@dp.message(AdminState.waiting_ban_input)
+async def process_ban_input(msg: Message, state: FSMContext):
+    if not is_admin(msg.from_user.id):
+        return
+    if msg.text and msg.text.startswith("/admin"):
+        await state.clear()
+        await msg.answer(admin_main_text(db), reply_markup=admin_main_kb(), parse_mode="HTML")
+        return
+
+    data = await state.get_data()
+    prefill_name = data.get("prefill_name")
+
+    if prefill_name:
+        # Режим quickban: сообщение — это просто причина
+        reason = (msg.text or "Нарушение правил").strip() or "Нарушение правил"
+        args = {"name": prefill_name, "reason": reason}
+    else:
+        args = parse_panel_ban(msg.text or "", db)
+
+    if not args.get("name") and not args.get("pfid") and not args.get("xuid"):
+        await msg.answer("❌ Не удалось определить цель. Попробуй ещё раз.", parse_mode="HTML")
+        return
+
+    wait = await msg.answer("⏳ Баню...")
+    ok, err = await mod_action(
+        "ban",
+        name=args.get("name"),
+        pfid=args.get("pfid"),
+        xuid=args.get("xuid"),
+        reason=args.get("reason", "Нарушение правил"),
+        by=msg.from_user.username or msg.from_user.first_name,
+    )
+    await wait.delete()
+
+    target_str = args.get("name") or args.get("pfid") or args.get("xuid") or "?"
+    tg_note    = args.get("tg_note")
+
+    if ok:
+        db.add_ban_log(target_str, args["reason"], str(msg.from_user.id))
+        note_line = f"\n📱 TG: {tg_note}" if tg_note else ""
+        await msg.answer(
+            f"🔨 <b>Игрок заблокирован!</b>\n\n"
+            f"👤 Цель: <code>{target_str}</code>{note_line}\n"
+            f"📝 Причина: {args['reason']}\n"
+            f"👮 {msg.from_user.username or msg.from_user.first_name}\n\n"
+            f"💡 pfid/xuid подставлены автоматически из pfids.json.",
+            reply_markup=back_kb(),
+            parse_mode="HTML"
+        )
+    else:
+        await msg.answer(
+            f"❌ Ошибка: <code>{err}</code>",
+            reply_markup=back_kb(),
+            parse_mode="HTML"
+        )
+    await state.clear()
+
+
+# ─── Разбан ──────────────────────────────────────────────────────────────────
+
+@dp.callback_query(F.data == "adm:unban")
+async def cb_admin_unban(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
+        await call.answer("❌", show_alert=True)
+        return
+
+    bans = db.get_ban_log()
+    if not bans:
+        await call.message.edit_text(
+            "📋 <b>Лог банов пуст.</b>\n\nНечего разбанивать.",
+            reply_markup=back_kb(),
+            parse_mode="HTML"
+        )
+        await call.answer()
+        return
+
+    # Строим инлайн-кнопки: последние 10 банов
+    rows = []
+    for b in bans[:10]:
+        t   = b.get("target", "?")[:20]
+        lbl = f"🔓 {t}"
+        rows.append([InlineKeyboardButton(
+            text=lbl,
+            callback_data=f"adm:unban_do:{b['target']}"
+        )])
+    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="adm:main")])
+
+    await call.message.edit_text(
+        "🔓 <b>Выбери игрока для разбана:</b>\n\n"
+        "Показаны последние 10 забаненных.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+        parse_mode="HTML"
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("adm:unban_do:"))
+async def cb_unban_do(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("❌", show_alert=True)
+        return
+
+    target = call.data.split(":", 2)[2]
+    ok, err = await mod_action(
+        "unban",
+        name=target,
+        by=call.from_user.username or call.from_user.first_name,
+    )
+    if ok:
+        await call.message.edit_text(
+            f"✅ <b>{target}</b> разблокирован!",
+            reply_markup=back_kb(),
+            parse_mode="HTML"
+        )
+    else:
+        await call.message.edit_text(
+            f"❌ Ошибка: <code>{err}</code>",
+            reply_markup=back_kb(),
+            parse_mode="HTML"
+        )
+    await call.answer()
+
+
+# ─── Кик ─────────────────────────────────────────────────────────────────────
+
+@dp.callback_query(F.data == "adm:kick")
+async def cb_admin_kick(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
+        await call.answer("❌", show_alert=True)
+        return
+    await state.set_state(AdminState.waiting_kick_input)
+    await call.message.edit_text(KICK_HELP, reply_markup=back_kb(), parse_mode="HTML")
+    await call.answer()
+
+
+@dp.message(AdminState.waiting_kick_input)
+async def process_kick_input(msg: Message, state: FSMContext):
+    if not is_admin(msg.from_user.id):
+        return
+    if msg.text and msg.text.startswith("/admin"):
+        await state.clear()
+        await msg.answer(admin_main_text(db), reply_markup=admin_main_kb(), parse_mode="HTML")
+        return
+
+    parts = (msg.text or "").split("|", 1)
+    name   = parts[0].strip()
+    reason = parts[1].strip() if len(parts) > 1 else "Кик администратором"
+
+    ok, err = await mod_action(
+        "kick",
+        name=name,
+        reason=reason,
+        by=msg.from_user.username or msg.from_user.first_name,
+    )
+    if ok:
+        await msg.answer(
+            f"👢 <b>{name}</b> кикнут.\n📝 {reason}",
+            reply_markup=back_kb(),
+            parse_mode="HTML"
+        )
+    else:
+        await msg.answer(
+            f"❌ Ошибка: <code>{err}</code>",
+            reply_markup=back_kb(),
+            parse_mode="HTML"
+        )
+    await state.clear()
+
+
+# ─── Мут ─────────────────────────────────────────────────────────────────────
+
+@dp.callback_query(F.data == "adm:mute")
+async def cb_admin_mute(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
+        await call.answer("❌", show_alert=True)
+        return
+    await state.set_state(AdminState.waiting_mute_input)
+    await call.message.edit_text(MUTE_HELP, reply_markup=back_kb(), parse_mode="HTML")
+    await call.answer()
+
+
+@dp.message(AdminState.waiting_mute_input)
+async def process_mute_input(msg: Message, state: FSMContext):
+    if not is_admin(msg.from_user.id):
+        return
+    if msg.text and msg.text.startswith("/admin"):
+        await state.clear()
+        await msg.answer(admin_main_text(db), reply_markup=admin_main_kb(), parse_mode="HTML")
+        return
+
+    parts  = (msg.text or "").split("|")
+    name   = parts[0].strip() if len(parts) > 0 else ""
+    dur    = int(parts[1].strip()) if len(parts) > 1 and parts[1].strip().isdigit() else 60
+    reason = parts[2].strip() if len(parts) > 2 else "Нарушение правил"
+
+    ok, err = await mod_action(
+        "mute",
+        name=name,
+        reason=reason,
+        duration_min=dur,
+        by=msg.from_user.username or msg.from_user.first_name,
+    )
+    if ok:
+        await msg.answer(
+            f"🔇 <b>{name}</b> заглушен на {dur} мин.\n📝 {reason}",
+            reply_markup=back_kb(),
+            parse_mode="HTML"
+        )
+    else:
+        await msg.answer(
+            f"❌ Ошибка: <code>{err}</code>",
+            reply_markup=back_kb(),
+            parse_mode="HTML"
+        )
+    await state.clear()
+
+
+# ─── Поиск MC-игрока (pfid/xuid из pfids.json) ───────────────────────────────
+
+@dp.callback_query(F.data == "adm:search_mc")
+async def cb_admin_search_mc(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
+        await call.answer("❌", show_alert=True)
+        return
+    await state.set_state(AdminState.waiting_search_mc)
+    await call.message.edit_text(SEARCH_MC_HELP, reply_markup=back_kb(), parse_mode="HTML")
+    await call.answer()
+
+
+@dp.message(AdminState.waiting_search_mc)
+async def process_search_mc(msg: Message, state: FSMContext):
+    if not is_admin(msg.from_user.id):
+        return
+    if msg.text and msg.text.startswith("/admin"):
+        await state.clear()
+        await msg.answer(admin_main_text(db), reply_markup=admin_main_kb(), parse_mode="HTML")
+        return
+
+    query = (msg.text or "").strip()
+    wait = await msg.answer("⏳ Читаю pfids.json с сервера...")
+
+    results = await search_players(query)
+    await wait.delete()
+
+    if not results:
+        await msg.answer(
+            f"❌ Игрок <code>{query}</code> не найден в pfids.json.\n\n"
+            "💡 Убедись что <b>pfid_bridge.py</b> запущен на сервере "
+            "и игрок хотя бы раз заходил после его запуска.",
+            reply_markup=back_kb(),
+            parse_mode="HTML"
+        )
+        await state.clear()
+        return
+
+    if len(results) == 1:
+        # Один результат — показываем карточку с кнопкой бана
+        p = results[0]
+        pfid = p.get("pfid", "")
+        xuid = p.get("xuid", "")
+        name = p.get("name", "?")
+
+        ban_cb = f"adm:quickban:{name}"
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔨 Забанить этого игрока", callback_data=ban_cb)],
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="adm:main")],
+        ])
+        await msg.answer(
+            f"✅ <b>Найден игрок:</b>\n\n{format_player_card(p)}",
+            reply_markup=kb,
+            parse_mode="HTML"
+        )
+    else:
+        # Несколько результатов — список
+        lines = [f"🔎 Найдено <b>{len(results)}</b> игроков по запросу <code>{query}</code>:\n"]
+        for p in results:
+            lines.append(format_player_card(p))
+        lines.append("\n💡 Уточни запрос для точного совпадения.")
+        await msg.answer(
+            "\n".join(lines),
+            reply_markup=back_kb(),
+            parse_mode="HTML"
+        )
+    await state.clear()
+
+
+@dp.callback_query(F.data.startswith("adm:quickban:"))
+async def cb_quickban(call: CallbackQuery, state: FSMContext):
+    """Быстрый бан игрока из карточки поиска — запрашивает только причину."""
+    if not is_admin(call.from_user.id):
+        await call.answer("❌", show_alert=True)
+        return
+    name = call.data.split(":", 2)[2]
+    await state.set_state(AdminState.waiting_ban_input)
+    # Предзаполняем имя — пользователю надо только написать причину
+    await state.update_data(prefill_name=name)
+    await call.message.edit_text(
+        f"🔨 <b>Бан игрока</b> <code>{name}</code>\n\n"
+        "Отправь причину бана (одним сообщением):\n"
+        "<code>Читы</code>\n"
+        "<code>X-Ray</code>\n"
+        "<code>Дюп</code>\n\n"
+        "pfid и xuid подставятся автоматически из pfids.json.\n\n"
+        "Отправь /admin чтобы отменить.",
+        reply_markup=back_kb(),
+        parse_mode="HTML"
+    )
+    await call.answer()
+
+
+# ─── Поиск по TG ─────────────────────────────────────────────────────────────
+
+@dp.callback_query(F.data == "adm:search_tg")
+async def cb_admin_search_tg(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
+        await call.answer("❌", show_alert=True)
+        return
+    await state.set_state(AdminState.waiting_search_tg)
+    await call.message.edit_text(SEARCH_HELP, reply_markup=back_kb(), parse_mode="HTML")
+    await call.answer()
+
+
+@dp.message(AdminState.waiting_search_tg)
+async def process_search_tg(msg: Message, state: FSMContext):
+    if not is_admin(msg.from_user.id):
+        return
+    if msg.text and msg.text.startswith("/admin"):
+        await state.clear()
+        await msg.answer(admin_main_text(db), reply_markup=admin_main_kb(), parse_mode="HTML")
+        return
+
+    query = (msg.text or "").strip()
+    result = None
+
+    if query.isdigit():
+        result = db.find_by_tg_id(query)
+    else:
+        result = db.find_by_tg_name(query.lstrip("@"))
+        if not result:
+            result = db.find_by_mc_name(query)
+
+    await msg.answer(
+        format_tg_search_result(result, query),
+        reply_markup=back_kb(),
+        parse_mode="HTML"
+    )
+    await state.clear()
+
+
+# ─── Лог банов ───────────────────────────────────────────────────────────────
+
+@dp.callback_query(F.data == "adm:banlog")
+async def cb_admin_banlog(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("❌", show_alert=True)
+        return
+    bans = db.get_ban_log()
+    await call.message.edit_text(
+        format_ban_log(bans, limit=10),
+        reply_markup=back_kb(),
+        parse_mode="HTML"
+    )
+    await call.answer()
+
+
+# ─── Статистика ──────────────────────────────────────────────────────────────
+
+@dp.callback_query(F.data == "adm:stats")
+async def cb_admin_stats(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("❌", show_alert=True)
+        return
+    stats   = db.get_stats()
+    verified = db.get_all_verified()
+    total   = stats.get("total", 0)
+    ver_cnt = stats.get("verified", 0)
+
+    # Последние 5 верифицированных
+    recent = sorted(verified, key=lambda u: u.get("verified_at", ""), reverse=True)[:5]
+    recent_lines = "\n".join(
+        f"  • {u.get('tg_name','?')} → <code>{u.get('mc_name') or '—'}</code> ({u.get('verified_at','?')})"
+        for u in recent
+    ) or "  (нет)"
+
+    text = (
+        f"📊 <b>Статистика верификаций</b>\n\n"
+        f"👤 Всего пользователей: <b>{total}</b>\n"
+        f"✅ Верифицировано: <b>{ver_cnt}</b>\n"
+        f"❌ Не верифицировано: <b>{total - ver_cnt}</b>\n\n"
+        f"🕐 <b>Последние верификации:</b>\n{recent_lines}"
+    )
+    await call.message.edit_text(text, reply_markup=back_kb(), parse_mode="HTML")
+    await call.answer()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ТЕКСТОВЫЕ КОМАНДЫ МОДЕРАЦИИ (совместимость со старым интерфейсом)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@dp.message(Command("ban"))
+async def cmd_ban(msg: Message):
+    if not is_admin(msg.from_user.id):
+        return
+
+    parts = msg.text.split(maxsplit=1)
+    if len(parts) < 2:
+        await msg.answer(
+            "📋 <b>Использование:</b>\n"
+            "/ban <code>Ник</code> <code>Причина</code>\n"
+            "/ban <code>pfid:abc123</code> <code>Причина</code>\n"
+            "/ban <code>xuid:253544</code> <code>Причина</code>\n\n"
+            "Или используй 🔧 /admin → Бан (поддерживает tg:@ник)",
+            parse_mode="HTML"
+        )
+        return
+
+    args = parse_mod_args(parts[1])
+    wait = await msg.answer("⏳ Бан...")
+    ok, err = await mod_action(
+        "ban",
+        name=args.get("name"),
+        pfid=args.get("pfid"),
+        xuid=args.get("xuid"),
+        reason=args.get("reason", "Нарушение правил"),
+        by=msg.from_user.username or msg.from_user.first_name,
+    )
+    await wait.delete()
+
+    target_str = args.get("name") or args.get("pfid") or args.get("xuid")
+    if ok:
+        db.add_ban_log(target_str, args.get("reason"), str(msg.from_user.id))
+        await msg.answer(
+            f"🔨 <b>Заблокирован!</b>\n\n"
+            f"👤 Цель: <code>{target_str}</code>\n"
+            f"📝 Причина: {args.get('reason')}\n"
+            f"👮 {msg.from_user.username or msg.from_user.first_name}",
+            parse_mode="HTML"
+        )
+    else:
+        await msg.answer(f"❌ Ошибка: {err}")
+
+
+@dp.message(Command("unban"))
+async def cmd_unban(msg: Message):
+    if not is_admin(msg.from_user.id):
+        return
+    parts = msg.text.split(maxsplit=1)
+    if len(parts) < 2:
+        await msg.answer("📋 /unban <code>Ник/pfid:/xuid:</code>", parse_mode="HTML")
+        return
+    args = parse_mod_args(parts[1])
+    wait = await msg.answer("⏳ Разбан...")
+    ok, err = await mod_action(
+        "unban",
+        name=args.get("name"),
+        pfid=args.get("pfid"),
+        xuid=args.get("xuid"),
+        by=msg.from_user.username or msg.from_user.first_name,
+    )
+    await wait.delete()
+    target_str = args.get("name") or args.get("pfid") or args.get("xuid")
+    if ok:
+        await msg.answer(f"✅ <b>{target_str}</b> разблокирован!", parse_mode="HTML")
+    else:
+        await msg.answer(f"❌ Ошибка: {err}")
+
+
+@dp.message(Command("kick"))
+async def cmd_kick(msg: Message):
+    if not is_admin(msg.from_user.id):
+        return
+    parts = msg.text.split(maxsplit=1)
+    if len(parts) < 2:
+        await msg.answer("📋 /kick <code>Ник</code> <code>Причина</code>", parse_mode="HTML")
+        return
+    args = parse_mod_args(parts[1])
+    ok, err = await mod_action(
+        "kick",
+        name=args.get("name"),
+        reason=args.get("reason", "Кик администратором"),
+        by=msg.from_user.username or msg.from_user.first_name,
+    )
+    target_str = args.get("name", "?")
+    if ok:
+        await msg.answer(f"👢 <b>{target_str}</b> кикнут.", parse_mode="HTML")
+    else:
+        await msg.answer(f"❌ Ошибка: {err}")
+
+
+@dp.message(Command("mute"))
+async def cmd_mute(msg: Message):
+    if not is_admin(msg.from_user.id):
+        return
+    parts = msg.text.split(maxsplit=1)
+    if len(parts) < 2:
+        await msg.answer(
+            "📋 /mute <code>Ник</code> <code>минуты</code> <code>Причина</code>",
+            parse_mode="HTML"
+        )
+        return
+    args = parse_mod_args(parts[1])
+    ok, err = await mod_action(
+        "mute",
+        name=args.get("name"),
+        reason=args.get("reason", "Нарушение правил"),
+        duration_min=args.get("duration_min", 60),
+        by=msg.from_user.username or msg.from_user.first_name,
+    )
+    target_str = args.get("name", "?")
+    dur = args.get("duration_min", 60)
+    if ok:
+        await msg.answer(f"🔇 <b>{target_str}</b> заглушен на {dur} мин.", parse_mode="HTML")
+    else:
+        await msg.answer(f"❌ Ошибка: {err}")
+
+
+@dp.message(Command("adminhelp"))
+async def cmd_adminhelp(msg: Message):
+    if not is_admin(msg.from_user.id):
+        return
+    await msg.answer(
+        "🔧 <b>Команды администратора:</b>\n\n"
+        "🎛 <b>/admin</b> — интерактивная панель\n\n"
+        "<b>Быстрые команды:</b>\n"
+        "/ban <code>Ник/pfid:/xuid:</code> <code>Причина</code>\n"
+        "/unban <code>Ник/pfid:/xuid:</code>\n"
+        "/kick <code>Ник</code> <code>Причина</code>\n"
+        "/mute <code>Ник</code> <code>мин</code> <code>Причина</code>\n\n"
+        "💡 <b>Панель /admin</b> дополнительно поддерживает:\n"
+        "• <code>tg:@username</code> — бан по TG-нику\n"
+        "• <code>tgid:123456789</code> — бан по TG ID\n"
+        "• Поиск верифицированных по TG-нику/ID\n"
+        "• Лог банов и статистику",
+        parse_mode="HTML"
+    )
+
+
+# ─── Неизвестные сообщения ───────────────────────────────────────────────────
+@dp.message()
+async def unknown(msg: Message, state: FSMContext):
+    # Если мы в FSM-состоянии — не реагируем (обрабатывается выше)
+    current = await state.get_state()
+    if current:
+        return
+    hint = " Или /admin для панели управления." if is_admin(msg.from_user.id) else ""
+    await msg.answer(
+        f"❓ Используйте /verify <code>КОД</code> для верификации или /help.{hint}",
+        parse_mode="HTML"
+    )
+
+
+# ─── Запуск ──────────────────────────────────────────────────────────────────
 async def main():
     logger.info("Bot starting...")
     await dp.start_polling(bot)
